@@ -1,0 +1,9 @@
+DeepCAD/*
+TinyLLaVA_Factory/*
+stock_test_output/*
+.vscode/*
+
+model-stock/code/__pycache__/*
+
+wise_ft/out/*
+wise_ft/fisher/*
