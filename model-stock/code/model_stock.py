@@ -1,161 +1,334 @@
 import torch
 import numpy as np
-import torchvision
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# load weights
-'''
-# origianl codes: 
-# pt format models
-pretrained_weight = '../models/clip_vit_b_32_pretrained.pt'
-finetuned_weight_1 = '../models/clip_vit_b_32_finetuned_1.pt'
-finetuned_weight_2 = '../models/clip_vit_b_32_finetuned_2.pt'
-'''
-
-# my codes:
-pretrained_weight = '../stock_test_output/pretrained_weight.pth' # not downloaded
-finetuned_weight_1 = '../stock_test_output/first_model/'
-finetuned_weight_2 = '../stock_test_output/second_model/'
-
-weight_pt = torch.load(pretrained_weight, map_location=device)
-weight_ft1 = torch.load(finetuned_weight_1, map_location=device)
-weight_ft2 = torch.load(finetuned_weight_2, map_location=device)
-
-import math 
+import json
+import os
+import shutil
+from safetensors.torch import load_file, save_file
 from collections import OrderedDict
-from math import sqrt
+
+# 경로 설정
+base_model_path = '../stock_test_output/base/'
+finetuned_path_1 = '../stock_test_output/full_finetune/'
+finetuned_path_2 = '../stock_test_output/second_full_converted/'
+
 EPS = 1e-8
 
-def compute_angle(state_dict_1, state_dict_2, ref_state_dict, add_ignore_keys=[], return_cos=False):
-    # Remove the keys not used for CLIP fine-tuning
-    ignore_keys = ['model.positional_embedding', 'model.text_projection', 'model.logit_scale',
-                        'model.token_embedding.weight', 'model.ln_final.weight', 'model.ln_final.bias']
-    ignore_keys += ['module.'+key for key in ignore_keys]
-    ignore_keys.extend(add_ignore_keys)
+def load_model_weights(model_path):
+    """분할된 model weights를 로드합니다."""
+    print(f"Loading model weights from {model_path}...")
+    
+    # safetensors index 파일 확인
+    index_path = os.path.join(model_path, 'model.safetensors.index.json')
+    
+    if os.path.exists(index_path):
+        # 분할된 safetensors 파일들 로드
+        with open(index_path, 'r') as f:
+            index_data = json.load(f)
+        
+        weight_map = index_data.get('weight_map', {})
+        files = set(weight_map.values())
+        
+        all_weights = {}
+        for file in files:
+            file_path = os.path.join(model_path, file)
+            if os.path.exists(file_path):
+                try:
+                    weights = load_file(file_path, device="cpu")
+                    # float16 → float32 변환
+                    weights = {k: v.float() if v.dtype == torch.float16 else v for k, v in weights.items()}
+                    all_weights.update(weights)
+                    print(f"Loaded {len(weights)} parameters from {file}")
+                except Exception as e:
+                    print(f"Error loading {file}: {e}")
+        
+        print(f"Total parameters: {len(all_weights)}")
+        return all_weights
+    
+    # 단일 safetensors 파일 확인
+    single_safetensors_path = os.path.join(model_path, 'model.safetensors')
+    if os.path.exists(single_safetensors_path):
+        try:
+            weights = load_file(single_safetensors_path, device="cpu")
+            weights = {k: v.float() if v.dtype == torch.float16 else v for k, v in weights.items()}
+            print(f"Loaded {len(weights)} parameters from single safetensors file")
+            return weights
+        except Exception as e:
+            print(f"Error loading single safetensors: {e}")
+    
+    # pytorch_model.bin 파일 확인
+    bin_path = os.path.join(model_path, 'pytorch_model.bin')
+    if os.path.exists(bin_path):
+        try:
+            weights = torch.load(bin_path, map_location='cpu')
+            weights = {k: v.float() if v.dtype == torch.float16 else v for k, v in weights.items()}
+            print(f"Loaded {len(weights)} parameters from pytorch_model.bin")
+            return weights
+        except Exception as e:
+            print(f"Error loading pytorch_model.bin: {e}")
+    
+    raise FileNotFoundError(f"No valid model file found in {model_path}")
 
-    return_dict = OrderedDict()
+def compute_angles_model_stock(w1_weights, w2_weights, w0_weights):
+    """Model Stock 공식으로 각도를 계산합니다."""
+    print("Computing angles using Model Stock formula...")
+    
+    angles = {}
+    
+    # Language model layers만 대상 (임베딩이나 분류기 제외)
+    target_layers = []
+    for key in w1_weights.keys():
+        # 주요 transformer layers만 선택
+        if any(pattern in key for pattern in [
+            'language_model.model.layers.',
+            'model.layers.',
+            'transformer.h.',
+            'blocks.'
+        ]) and not any(skip in key for skip in [
+            'embed_tokens', 'lm_head', 'norm', 'embedding'
+        ]):
+            target_layers.append(key)
+    
+    print(f"Target layers for angle computation: {len(target_layers)}")
+    
+    computed_count = 0
+    
+    for key in target_layers:
+        if key in w1_weights and key in w2_weights and key in w0_weights:
+            try:
+                w0 = w0_weights[key].float()
+                w1 = w1_weights[key].float()
+                w2 = w2_weights[key].float()
+                
+                # Model Stock: (w1 - w0)와 (w2 - w0) 간의 각도
+                delta1 = (w1 - w0).flatten()
+                delta2 = (w2 - w0).flatten()
+                
+                # 코사인 유사도 계산
+                dot_product = torch.sum(delta1 * delta2)
+                norm1 = torch.sqrt(torch.sum(delta1 ** 2))
+                norm2 = torch.sqrt(torch.sum(delta2 ** 2))
+                
+                if norm1 > EPS and norm2 > EPS:
+                    cosine_val = dot_product / (norm1 * norm2 + EPS)
+                    cosine_val = torch.clamp(cosine_val, min=-1., max=1.)
+                    
+                    angle_rad = torch.acos(cosine_val)
+                    angle_deg = np.rad2deg(angle_rad.item())
+                    
+                    angles[key] = angle_deg
+                    computed_count += 1
+                    
+                    # 처음 5개만 출력
+                    if computed_count <= 5:
+                        print(f"   {key}: {angle_deg:.2f}°")
+                
+            except Exception as e:
+                print(f"Error computing angle for {key}: {e}")
+    
+    print(f"Computed angles for {computed_count} layers")
+    return angles
 
-    with torch.no_grad():
-        for key in ref_state_dict:
-            if key in ignore_keys:
-                continue
+def compute_interpolation_ratios(angles_dict, k=2):
+    """각도에서 interpolation ratio를 계산합니다.
+    Model Stock 논문의 공식: t = k*cos(θ)/((k-1)*cos(θ)+1)
+    """
+    ratios = {}
+    for key, angle_deg in angles_dict.items():
+        angle_rad = np.deg2rad(angle_deg)
+        cos_theta = np.cos(angle_rad)
+        
+        # Model Stock 공식
+        ratio = k * cos_theta / ((k-1) * cos_theta + 1 + EPS)
+        # ratio를 0과 1 사이로 클램핑
+        ratio = np.clip(ratio, 0.0, 1.0)
+        ratios[key] = ratio
+    
+    return ratios
 
-            state_dict_1_val = state_dict_1[key]            
-            state_dict_2_val = state_dict_2[key]                        
-            ref_val = ref_state_dict[key]
-
-            if not (state_dict_1_val.shape == state_dict_2_val.shape == ref_val.shape):
-                continue 
-
-            vector1 = (state_dict_1_val - ref_val).clone().detach()
-            vector2 = (state_dict_2_val - ref_val).clone().detach()
-
-            vector1 = vector1.float()
-            vector2 = vector2.float()
-
-            cosine_val = torch.sum(vector1 * vector2) / (sqrt(torch.sum(vector1 ** 2) * torch.sum(vector2 ** 2))+EPS)
-            cosine_val = torch.clamp(cosine_val, min=-1., max=1.) # Too prevent nan from acos
-            if return_cos:
-                return_dict[key] = cosine_val 
+def merge_weights_model_stock(w0_weights, w1_weights, w2_weights, ratios):
+    """Model Stock 방식으로 weights를 병합합니다.
+    
+    논문의 공식:
+    1. w12 = (w1 + w2) / 2  (두 fine-tuned 모델의 평균)
+    2. wH = (1-t) * w0 + t * w12  (pre-trained와 평균 모델의 보간)
+    """
+    print("Merging weights using Model Stock...")
+    
+    merged_weights = {}
+    model_stock_count = 0
+    simple_average_count = 0
+    base_only_count = 0
+    
+    for key in w0_weights.keys():
+        if key in w1_weights and key in w2_weights:
+            # 두 fine-tuned 모델의 평균 계산
+            w12 = (w1_weights[key].float() + w2_weights[key].float()) * 0.5
+            
+            if key in ratios:
+                # Model Stock 공식 적용
+                t = float(ratios[key])
+                merged_weight = (1 - t) * w0_weights[key].float() + t * w12
+                merged_weights[key] = merged_weight
+                model_stock_count += 1
+                
+                # 처음 5개의 비율만 출력
+                if model_stock_count <= 5:
+                    print(f"   {key}: t={t:.4f}")
             else:
-                return_dict[key] = np.rad2deg(torch.acos(cosine_val).detach().cpu())
-
-    return return_dict
-
-def compute_ratio(angle_dict, k=2):
-    ratio_dict = {}
-    for key in angle_dict.keys():
-        angle = np.deg2rad(angle_dict[key])
-        ratio_dict[key] = k*np.cos(angle)/((k-1)*np.cos(angle)+1+EPS)
-    return ratio_dict 
-
-# Compute angles
-angle = compute_angle(weight_ft1, weight_ft2, weight_pt)
-ratio = compute_ratio(angle)
-print(angle.keys())
-
-# Visualization 
-'''
-data = angle.items() 
-x = list(range(len(data)))
-y = [float(item[1]) for item in data]
-colors = ['green' if 'ln' in item[0] else 
-          'red' if 'weight' in item[0] else 
-          'blue' if 'bias' in item[0] else 
-          'black' for item in data]
-
-plt.figure(figsize=(8, 3))
-plt.scatter(x, y, c=colors)
-plt.xlabel('Parameter Index')
-plt.ylabel('Angle')
-plt.title('Angle between w_1 and w_2 based on w_0')
-# add legend right top
-plt.scatter([], [], c='red', label='MLP/Attn weight')
-plt.scatter([], [], c='blue', label='MLP/Attn bias')
-plt.scatter([], [], c='green', label='LN weight/bias')
-plt.scatter([], [], c='black', label='Others')
-plt.legend(loc='upper right')
-plt.show()
-
-data = ratio.items() 
-x = list(range(len(data)))
-y = [float(item[1]) for item in data]
-plt.figure(figsize=(8, 3))
-plt.scatter(x, y, c=colors)
-plt.xlabel('Parameter Index')
-plt.ylabel('Interpolation ratio')
-plt.title('Interpolation ratio between w_12 and w_0')
-# add legend right top
-plt.scatter([], [], c='red', label='MLP/Attn weight')
-plt.scatter([], [], c='blue', label='MLP/Attn bias')
-plt.scatter([], [], c='green', label='LN weight/bias')
-plt.scatter([], [], c='black', label='Others')
-plt.legend(loc='lower right')
-plt.show()
-'''
-
-# evaluate stage. must be edited 
-import copy 
-def merge(w1, w2, w0, ratio):
-    w12 = {} # w12 = (w1 + w2) / 2
-    for key in w1.keys():                
-        w12[key] = (w1[key].clone() + w2[key].clone()) / 2.
-
-    w_merge = copy.deepcopy(w12)
-    for key, r in ratio.items():        
-        w_merge[key] = w12[key].clone() * r + w0[key].clone() * (1. - r)
-    return w_merge
+                # 비율 정보가 없으면 순수 평균 적용
+                merged_weights[key] = w12
+                simple_average_count += 1
+        else:
+            # 하나라도 없으면 base model 사용
+            merged_weights[key] = w0_weights[key].float()
+            base_only_count += 1
     
-# Merge weights 
-merged_weight = merge(weight_ft1, weight_ft2, weight_pt, ratio)
-
-import sys
-sys.path.append('../model-soups')
-import clip
-base_model, preprocess = clip.load('ViT-B/32', 'cpu', jit=False)
-
-from datasets import ImageNet, ImageNetV2, ImageNetSketch, ImageNetR, ObjectNet, ImageNetA
-from utils import get_model_from_sd, test_model_on_dataset
-
-data_location = '/path/to/dataset/'
-data_location = '/mnt/tmp/'
-batch_size = 256
-workers = 4
-
-# reference: https://github.com/mlfoundations/model-soups/blob/main/main.py#L90-L103
-model = get_model_from_sd(merged_weight, base_model)
-results = {}
-for dataset_cls in [ImageNet, ImageNetV2, ImageNetSketch, ImageNetR, ObjectNet, ImageNetA]:
-    print(f'Evaluating on {dataset_cls.__name__}.')
-    dataset = dataset_cls(preprocess, data_location, batch_size)
-    accuracy = test_model_on_dataset(model, dataset)
-    results[dataset_cls.__name__] = accuracy
-    print(accuracy)
+    print(f"Model Stock applied to {model_stock_count} layers")
+    print(f"Simple averaged {simple_average_count} layers")
+    print(f"Base only {base_only_count} layers")
+    print(f"Total merged layers: {len(merged_weights)}")
     
-print(f'In-distribution (ImageNet): {results["ImageNet"]}')
-print(f'Average of out-of-distributions: {np.mean(list(results.values())[1:])}')
+    return merged_weights
+
+def save_merged_model(merged_weights, output_path):
+    """병합된 모델을 저장합니다."""
+    print(f"Saving merged model to {output_path}...")
+    os.makedirs(output_path, exist_ok=True)
+
+    # CPU로 이동
+    cpu_weights = {k: v.cpu() for k, v in merged_weights.items()}
+    
+    # Safetensors 형식으로 저장
+    safetensors_path = os.path.join(output_path, 'model.safetensors')
+    save_file(cpu_weights, safetensors_path)
+    print(f"Saved merged weights to {safetensors_path}")
+
+    # PyTorch 형식으로도 저장
+    bin_path = os.path.join(output_path, 'pytorch_model.bin')
+    torch.save(cpu_weights, bin_path)
+    print(f"Saved PyTorch checkpoint to {bin_path}")
+
+    # 설정 파일들 복사
+    config_files = [
+        'config.json',
+        'tokenizer_config.json', 
+        'special_tokens_map.json',
+        'tokenizer.model',
+        'tokenizer.json',
+        'vocab.txt',
+        'merges.txt'
+    ]
+    
+    for fname in config_files:
+        # 첫 번째 모델에서 복사 시도
+        src = os.path.join(finetuned_path_1, fname)
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(output_path, fname))
+            print(f"Copied {fname}")
+        else:
+            # 베이스 모델에서 복사 시도
+            src = os.path.join(base_model_path, fname)
+            if os.path.isfile(src):
+                shutil.copy(src, os.path.join(output_path, fname))
+                print(f"Copied {fname} from base model")
+            else:
+                print(f"⚠️ {fname} not found, skipping.")
+
+def analyze_weight_statistics(w0, w1, w2, angles, ratios):
+    """가중치 통계 분석."""
+    print("\n=== Weight Statistics Analysis ===")
+    
+    # 각도 통계
+    angle_values = list(angles.values())
+    print(f"Angles - Mean: {np.mean(angle_values):.2f}°, Std: {np.std(angle_values):.2f}°")
+    print(f"Angles - Min: {np.min(angle_values):.2f}°, Max: {np.max(angle_values):.2f}°")
+    
+    # 비율 통계
+    ratio_values = list(ratios.values())
+    print(f"Ratios - Mean: {np.mean(ratio_values):.4f}, Std: {np.std(ratio_values):.4f}")
+    print(f"Ratios - Min: {np.min(ratio_values):.4f}, Max: {np.max(ratio_values):.4f}")
+    
+    # 모델 간 유사도 분석
+    total_params = 0
+    total_similarity_01 = 0
+    total_similarity_02 = 0
+    total_similarity_12 = 0
+    
+    for key in w0.keys():
+        if key in w1 and key in w2:
+            w0_flat = w0[key].flatten()
+            w1_flat = w1[key].flatten()
+            w2_flat = w2[key].flatten()
+            
+            # 코사인 유사도
+            sim_01 = torch.cosine_similarity(w0_flat.unsqueeze(0), w1_flat.unsqueeze(0)).item()
+            sim_02 = torch.cosine_similarity(w0_flat.unsqueeze(0), w2_flat.unsqueeze(0)).item()
+            sim_12 = torch.cosine_similarity(w1_flat.unsqueeze(0), w2_flat.unsqueeze(0)).item()
+            
+            num_params = w0_flat.numel()
+            total_params += num_params
+            total_similarity_01 += sim_01 * num_params
+            total_similarity_02 += sim_02 * num_params
+            total_similarity_12 += sim_12 * num_params
+    
+    print(f"Average cosine similarity (w0 vs w1): {total_similarity_01/total_params:.4f}")
+    print(f"Average cosine similarity (w0 vs w2): {total_similarity_02/total_params:.4f}")
+    print(f"Average cosine similarity (w1 vs w2): {total_similarity_12/total_params:.4f}")
+
+def main():
+    """Model Stock 알고리즘 실행"""
+    print("=== Model Stock for Full Fine-tuned Models ===")
+    
+    # 1. 모델 가중치 로드
+    print("\n1. Loading model weights...")
+    w0_weights = load_model_weights(base_model_path)
+    w1_weights = load_model_weights(finetuned_path_1) 
+    w2_weights = load_model_weights(finetuned_path_2)
+    
+    # 2. 각도 계산
+    print("\n2. Computing angles between fine-tuned models...")
+    angles = compute_angles_model_stock(w1_weights, w2_weights, w0_weights)
+    
+    if not angles:
+        raise RuntimeError("No angles computed, cannot proceed.")
+    
+    # 3. 보간 비율 계산
+    print("\n3. Computing interpolation ratios...")
+    ratios = compute_interpolation_ratios(angles, k=2)
+    
+    # 4. 가중치 병합
+    print("\n4. Merging weights using Model Stock...")
+    merged_weights = merge_weights_model_stock(w0_weights, w1_weights, w2_weights, ratios)
+    
+    # 5. 통계 분석
+    analyze_weight_statistics(w0_weights, w1_weights, w2_weights, angles, ratios)
+    
+    # 6. 병합된 모델 저장
+    print("\n5. Saving merged model...")
+    output_path = '../stock_test_output/full2_model_stock/'
+    save_merged_model(merged_weights, output_path)
+    
+    # 7. 메타데이터 저장
+    print("\n6. Saving metadata...")
+    metadata = {
+        "method": "Model Stock",
+        "base_model": base_model_path,
+        "finetuned_models": [finetuned_path_1, finetuned_path_2],
+        "angles": {k: float(v) for k, v in angles.items()},
+        "ratios": {k: float(v) for k, v in ratios.items()},
+        "statistics": {
+            "num_layers_merged": len(angles),
+            "mean_angle": float(np.mean(list(angles.values()))),
+            "mean_ratio": float(np.mean(list(ratios.values())))
+        }
+    }
+    
+    metadata_path = os.path.join(output_path, 'model_stock_info.json')
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {metadata_path}")
+    
+    print("\n=== Model Stock merge completed successfully! ===")
+
+if __name__ == "__main__":
+    main()

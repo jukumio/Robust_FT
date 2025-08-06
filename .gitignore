@@ -7,3 +7,6 @@ model-stock/code/__pycache__/*
 
 wise_ft/out/*
 wise_ft/fisher/*
+
+pythonocc_operator/*
+

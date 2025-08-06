@@ -7,7 +7,7 @@ from safetensors.torch import load_file, save_file
 from collections import OrderedDict
 
 # 경로 설정
-base_model_path = '../stock_test_output/base/'
+base_model_path = '../stock_test_output/full_finetune/'
 finetuned_path_1 = '../stock_test_output/first_model/'
 finetuned_path_2 = '../stock_test_output/old_second_model/'
 
@@ -207,24 +207,31 @@ def merge_weights_model_stock(base_weights, lora_deltas_1, lora_deltas_2, ratios
     model_stock_count = 0
     simple_average_count = 0
     
+def merge_weights_model_stock(base_weights, lora_deltas_1, lora_deltas_2, ratios):
+    """Model Stock 비율을 사용해 delta들을 병합하고 full weights를 생성합니다."""
+    print("Merging weights using Model Stock ratios...")
+    
+    merged_weights = {}
+    model_stock_count = 0
+    simple_average_count = 0
+    
     for base_key, base_weight in base_weights.items():
-        # 둘 다 LoRA delta가 있을 때
         if base_key in lora_deltas_1 and base_key in lora_deltas_2:
+            delta1 = lora_deltas_1[base_key]
+            delta2 = lora_deltas_2[base_key]
+            # w12 = (w1 + w2) / 2  → delta12 = (delta1 + delta2) / 2
+            delta12 = (delta1 + delta2) * 0.5
             if base_key in ratios:
-                # Model Stock ratio 사용
                 t = float(np.clip(ratios[base_key], 0.0, 1.0))
-                # 올바른 방식: delta_merged = t * (delta1 + delta2) / 2
-                delta_avg = (lora_deltas_1[base_key] + lora_deltas_2[base_key]) / 2.0
-                merged_delta = t * delta_avg
-                merged_weights[base_key] = base_weight.float() + merged_delta
+                # 논문 공식: w_H = (1 - t) * w0 + t * w12
+                merged_weight = (1 - t) * base_weight.float() + t * (base_weight.float() + delta12)
+                merged_weights[base_key] = merged_weight
                 model_stock_count += 1
             else:
-                # 비율 정보가 없으면 단순 평균
-                delta_avg = (lora_deltas_1[base_key] + lora_deltas_2[base_key]) / 2.0
-                merged_weights[base_key] = base_weight.float() + delta_avg
+                # 비율 정보 없으면 순수 w12 적용
+                merged_weights[base_key] = base_weight.float() + delta12
                 simple_average_count += 1
         else:
-            # LoRA 델타가 하나만 있거나 없으면 base 그대로
             merged_weights[base_key] = base_weight.float()
     
     print(f"Model Stock applied to {model_stock_count} layers")
@@ -279,13 +286,13 @@ def main():
         raise RuntimeError("No angles computed, cannot proceed.")
     ratios = compute_interpolation_ratios(angles, k=2)
     merged = merge_weights_model_stock(base, d1, d2, ratios)
-    save_merged_full_model(merged, '../stock_test_output/model_stock_full/')
+    save_merged_full_model(merged, '../stock_test_output/stock_with_full/')
     # optionally, save ratios/angles json
     info = {
         "angles": {k: float(v) for k, v in angles.items()},
         "ratios": ratios
     }
-    with open('../stock_test_output/model_stock_full/info.json', 'w') as f:
+    with open('../stock_test_output/stock_with_full/info.json', 'w') as f:
         json.dump(info, f, indent=2)
     print("Model Stock merge complete.")
 
